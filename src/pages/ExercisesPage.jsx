@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { analyzePose, createLog, fetchExercises, getTtsStatus } from '../services/api';
+import { createLog, fetchExercises, getTtsStatus } from '../services/api';
 import CanvasOverlay from '../components/CanvasOverlay';
 import { evaluatePose } from '../utils/poseStages';
 import {
@@ -16,7 +16,6 @@ import {
 } from '../utils/language';
 import { cancelCoachSpeech, getInstalledSpeechVoices, isCoachSpeechActive, speakCoachText, unlockCoachAudio } from '../utils/speech';
 
-const ANALYZE_INTERVAL_MS = 1800;
 const POSE_INTERVAL_MS = 100;
 const MODEL_WASM_VERSION = '0.10.22-rc.20250304';
 const SMOOTH_ALPHA = 0.35;
@@ -70,11 +69,8 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const canvasRef = useRef(null);
   const rafRef = useRef(0);
-  const lastSentRef = useRef(0);
   const lastPoseRef = useRef(0);
-  const analyzeInFlightRef = useRef(null);
   const landmarkerRef = useRef(null);
   const sessionRef = useRef(null);
   const startInProgressRef = useRef(false);
@@ -85,7 +81,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
   const speechGateRef = useRef(false);
   const posingFramesRef = useRef(0);
   const latestCueRef = useRef('');
-  const [annotatedImage, setAnnotatedImage] = useState('');
 
   voiceEnabledRef.current = voiceEnabled;
 
@@ -186,7 +181,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
     setAnalysis(null);
     setRisk(getSessionRisk(null));
     smoothedScoreRef.current = null;
-    setAnnotatedImage('');
     updateSpeechGate(false);
   }, [selectedExerciseId, updateSpeechGate]);
 
@@ -223,7 +217,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
   function stopCamera() {
     cameraStartVersionRef.current += 1;
     startInProgressRef.current = false;
-    analyzeInFlightRef.current = null;
     updateSpeechGate(false);
     const savePromise = finishSession();
     cancelCoachSpeech();
@@ -279,7 +272,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
     startInProgressRef.current = true;
     try {
       setCameraError('');
-      setAnnotatedImage('');
       setModelStatus('Starting camera and loading the on-device pose model...');
       updateSpeechGate(false);
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -311,17 +303,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
       await video.play();
       if (startVersion !== cameraStartVersionRef.current) return;
 
-      const exercise = exercises.find(item => String(item.id) === String(selectedExerciseId));
-      sessionRef.current = createSessionMetrics(
-        /^\d+$/.test(selectedExerciseId) ? Number(selectedExerciseId) : null,
-        exercise?.name || 'Exercise',
-      );
-      lastSentRef.current = 0;
-      lastPoseRef.current = 0;
-      smoothedScoreRef.current = null;
-      setRisk(getSessionRisk(null));
-      setRunning(true);
-
       try {
         const vision = await import('@mediapipe/tasks-vision');
         const { FilesetResolver, PoseLandmarker } = vision;
@@ -341,12 +322,21 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
           return;
         }
         landmarkerRef.current = landmarker;
-        setModelStatus('On-device MediaPipe full model is ready.');
       } catch {
         if (startVersion !== cameraStartVersionRef.current) return;
-        landmarkerRef.current = null;
-        setModelStatus('On-device model could not load. Trying the server pose analyzer.');
+        throw new Error('The on-device pose model could not load. Check your connection and try again.');
       }
+
+      const exercise = exercises.find(item => String(item.id) === String(selectedExerciseId));
+      sessionRef.current = createSessionMetrics(
+        /^\d+$/.test(selectedExerciseId) ? Number(selectedExerciseId) : null,
+        exercise?.name || 'Exercise',
+      );
+      lastPoseRef.current = 0;
+      smoothedScoreRef.current = null;
+      setRisk(getSessionRisk(null));
+      setModelStatus('On-device MediaPipe full model is ready.');
+      setRunning(true);
     } catch (error) {
       if (startVersion !== cameraStartVersionRef.current) return;
       setCameraError(error?.message || 'Camera permission denied or unavailable.');
@@ -355,6 +345,12 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
       const stream = streamRef.current;
       if (stream) stream.getTracks().forEach(track => track.stop());
       streamRef.current = null;
+      const video = videoRef.current;
+      if (video) video.srcObject = null;
+      if (landmarkerRef.current) {
+        try { landmarkerRef.current.close(); } catch { /* The model may not have finished initializing. */ }
+        landmarkerRef.current = null;
+      }
       sessionRef.current = null;
     } finally {
       if (startVersion === cameraStartVersionRef.current) startInProgressRef.current = false;
@@ -378,14 +374,8 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
     function loop(timestamp) {
       if (!running) return;
       const video = videoRef.current;
-      const canvas = canvasRef.current;
 
-      if (video && canvas && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
-        const context = canvas.getContext('2d');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
+      if (video && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
         const landmarker = landmarkerRef.current;
         if (landmarker && timestamp - lastPoseRef.current >= POSE_INTERVAL_MS) {
           lastPoseRef.current = timestamp;
@@ -446,88 +436,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
           }
         }
 
-        if (!landmarker && analyzeInFlightRef.current == null && timestamp - lastSentRef.current >= ANALYZE_INTERVAL_MS) {
-          lastSentRef.current = timestamp;
-          const requestVersion = cameraStartVersionRef.current;
-          analyzeInFlightRef.current = requestVersion;
-          const imageBase64 = canvas.toDataURL('image/jpeg', 0.76);
-          analyzePose({ imageBase64, exerciseId: selectedExerciseId })
-            .then(response => {
-              if (requestVersion !== cameraStartVersionRef.current || !streamRef.current) return;
-              const hasPose = typeof response?.pose_detected === 'boolean'
-                ? response.pose_detected
-                : Array.isArray(response?.landmarks) && response.landmarks.length >= 33;
-              const fullBodyVisible = Boolean(hasPose && hasFullBodyPose(response?.landmarks));
-              const responseAngles = response?.angles || {};
-              const selectedName = (exercises.find(item => String(item.id) === String(selectedExerciseId))?.name || '').toLowerCase();
-              const leftKnee = responseAngles.left_knee;
-              const rightKnee = responseAngles.right_knee;
-              const kneeAverage = Number.isFinite(responseAngles.knee_average)
-                ? responseAngles.knee_average
-                : Number.isFinite(leftKnee) && Number.isFinite(rightKnee)
-                  ? (leftKnee + rightKnee) / 2
-                  : null;
-              const frontKnee = Number.isFinite(responseAngles.front_knee)
-                ? responseAngles.front_knee
-                : Number.isFinite(leftKnee) && Number.isFinite(rightKnee)
-                  ? Math.min(leftKnee, rightKnee)
-                  : null;
-              const elbowAverage = responseAngles.elbow_average;
-              const phase = (selectedName.includes('warrior') || selectedName.includes('lunge') || selectedName.includes('tree'))
-                && frontKnee > 150
-                ? 'setup'
-                : (selectedName.includes('squat') || selectedName.includes('chair')) && kneeAverage > 155
-                  ? 'standing'
-                  : selectedName.includes('push') && elbowAverage >= 150
-                    ? 'top'
-                    : 'hold';
-              const issueKeys = response?.error_joints || [];
-              const fallbackEvaluation = {
-                detected: fullBodyVisible,
-                score: Number(response?.overall_score) || 0,
-                issueKeys: phase === 'setup'
-                  ? []
-                  : phase === 'standing'
-                    ? issueKeys.filter(key => !String(key).includes('knee'))
-                    : issueKeys,
-                phase,
-                angles: responseAngles,
-              };
-              const posing = fullBodyVisible && hasStartedExercisePose(selectedName, fallbackEvaluation);
-              posingFramesRef.current = posing ? posingFramesRef.current + 1 : 0;
-              const speechReady = posing && posingFramesRef.current >= 3;
-              recordSessionSample(sessionRef.current, fallbackEvaluation, Date.now());
-              const currentRisk = getSessionRisk(sessionRef.current);
-              updateRisk(currentRisk);
-              setAnalysis({
-                ...(response || {}),
-                pose_detected: fullBodyVisible,
-                overall_score: fullBodyVisible ? fallbackEvaluation.score : 0,
-                landmarks: fullBodyVisible ? response?.landmarks : [],
-                suggestions: fullBodyVisible
-                  ? response?.suggestions || ['No person detected. Ensure you are fully in frame and well lit.']
-                  : ['No full body pose detected. Step back until your head, hips, knees and feet are in frame.'],
-              });
-              if (response?.annotated_image_b64) {
-                const nextImage = 'data:image/jpeg;base64,' + response.annotated_image_b64;
-                setAnnotatedImage(nextImage);
-              }
-              const cue = currentRisk.level === 'elevated'
-                ? currentRisk.message
-                : response?.suggestions?.[0];
-              if (speechReady) updateSpeechGate(true, cue);
-              else if (!posing) updateSpeechGate(false);
-            })
-            .catch(() => {
-              if (requestVersion === cameraStartVersionRef.current) {
-                updateSpeechGate(false);
-                setModelStatus('Could not reach the server pose analyzer.');
-              }
-            })
-            .finally(() => {
-              if (analyzeInFlightRef.current === requestVersion) analyzeInFlightRef.current = null;
-            });
-        }
       }
       rafRef.current = requestAnimationFrame(loop);
     }
@@ -606,7 +514,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
               autoPlay
               className="absolute inset-0 h-full w-full object-contain"
             />
-            <canvas ref={canvasRef} className="hidden" />
             {analysis?.landmarks?.length > 0 && (
               <CanvasOverlay
                 landmarks={analysis.landmarks}
@@ -659,7 +566,6 @@ export default function ExercisesPage({ language = 'en', onLanguageChange = () =
           analysis={analysis}
           exerciseName={selectedExercise?.name}
           referenceImage={referenceImage}
-          annotatedImage={annotatedImage}
           running={running}
           risk={risk}
           voiceEnabled={voiceEnabled}
@@ -680,7 +586,6 @@ function CoachPanel({
   analysis,
   exerciseName,
   referenceImage,
-  annotatedImage,
   running,
   risk,
   voiceEnabled,
@@ -709,10 +614,10 @@ function CoachPanel({
     <aside className="space-y-4">
       <section className="neo-card">
         <div className="coach-reference">
-          {annotatedImage || referenceImage ? (
+          {referenceImage ? (
             <img
-              src={annotatedImage || referenceImage}
-              alt={annotatedImage ? 'Pose landmarks detected by the server' : 'Exercise reference pose'}
+              src={referenceImage}
+              alt="Exercise reference pose"
               className="h-full w-full object-contain"
             />
           ) : (

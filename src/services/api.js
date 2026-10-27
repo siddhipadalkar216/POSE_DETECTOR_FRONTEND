@@ -1,19 +1,6 @@
 // Empty by default so development and production can proxy /api on the same origin.
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
-export async function analyzePose({ imageBase64, exerciseId }) {
-  const params = new URLSearchParams();
-  if (exerciseId) params.set('exercise_id', exerciseId);
-  const token = localStorage.getItem('auth_token');
-  const res = await fetch(`${API_BASE_URL}/api/v1/pose/analyze?${params.toString()}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: JSON.stringify({ image_base64: imageBase64 }),
-  });
-  if (!res.ok) throw new Error('Analyze failed');
-  return res.json();
-}
-
 // Auth
 export async function registerUser({ username, password, email, name }) {
   const res = await fetch(`${API_BASE_URL}/api/v1/auth/register`, {
